@@ -138,7 +138,7 @@ iterations and number of concurrent threads. Results will be displayed afterward
 		}
 
 		// output benchmark results
-		outputRunDetails(maxThreads, results, overhead)
+		outputRunDetails(maxThreads, results, overhead, legacy)
 
 		log.Info("Benchmark runs complete")
 		return nil
@@ -168,7 +168,7 @@ func runBenchmark(ctx context.Context, benchType benches.Type, driverConfig benc
 		driverInfo string
 	)
 
-	if !legacyMode {
+	if legacyMode {
 		stats = make([][]benches.RunStatistics, driverConfig.Threads)
 		// Legacy mode in total run N test suites. for each test suite, it runs with n thread and n is the current thread numbers.
 		for i := 1; i <= driverConfig.Threads; i++ {
@@ -271,7 +271,7 @@ func getDelta(before, after float64) float64 {
 	}
 }
 
-func outputRunDetails(maxThreads int, results []benchResult, overhead bool) {
+func outputRunDetails(maxThreads int, results []benchResult, overhead bool, legacyMode bool) {
 	w := tabwriter.NewWriter(os.Stdout, 10, 4, 2, ' ', tabwriter.AlignRight)
 
 	fmt.Printf("\nSUMMARY TIMINGS/THREAD RATES\n\n")
@@ -282,11 +282,11 @@ func outputRunDetails(maxThreads int, results []benchResult, overhead bool) {
 	fmt.Fprintln(w, "\t ")
 
 	for _, result := range results {
-		fmt.Fprintf(w, "%s\t%d\t%7.2f", result.name, result.iterations, result.threadRates[0])
-		for i := 1; i < result.threads; i++ {
-			fmt.Fprintf(w, "\t%7.2f", result.threadRates[i])
+		if legacyMode {
+			outputThreadRatesLegacy(w, result)
+		} else {
+			outputThreadRates(w, result)
 		}
-		fmt.Fprintln(w, "\t ")
 	}
 	w.Flush()
 	fmt.Println("")
@@ -300,18 +300,12 @@ func outputRunDetails(maxThreads int, results []benchResult, overhead bool) {
 			// the limit "benchmark" has no detailed statistics
 			continue
 		}
-		for i := 0; i < result.threads; i++ {
-			fmt.Fprintf(w, "%s:%d\tMin\tMax\tAvg\tMedian\tStddev\tErrors\t\n", result.name, i+1)
-			cmdTimings := parseStats(result.statistics[i])
-			// given we are working with a map, but we want consistent ordering in the output
-			// we walk a slice of commands in a natural/expected order and output stats for
-			// those that were used during the specific run
-			for _, cmd := range cmdList {
-				if stats, ok := cmdTimings[cmd]; ok {
-					fmt.Fprintf(w, "%s\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%d\t\n", cmd, stats.min, stats.max, stats.avg, stats.median, stats.stddev, stats.errors)
-				}
-			}
+		if legacyMode {
+			outputDetailCommandStatsLegacy(result, w, cmdList)
+		} else {
+			outputDetailCommandStats(result, w, cmdList)
 		}
+
 		fmt.Println("")
 	}
 
@@ -376,6 +370,52 @@ func outputRunDetails(maxThreads int, results []benchResult, overhead bool) {
 
 		w.Flush()
 	}
+}
+
+func outputDetailCommandStatsLegacy(result benchResult, w *tabwriter.Writer, cmdList []string) {
+	for i := 0; i < result.threads; i++ {
+		fmt.Fprintf(w, "%s:%d\tMin\tMax\tAvg\tMedian\tStddev\tErrors\t\n", result.name, i+1)
+		cmdTimings := parseStats(result.statistics[i])
+		// given we are working with a map, but we want consistent ordering in the output
+		// we walk a slice of commands in a natural/expected order and output stats for
+		// those that were used during the specific run
+		for _, cmd := range cmdList {
+			if stats, ok := cmdTimings[cmd]; ok {
+				fmt.Fprintf(w, "%s\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%d\t\n", cmd, stats.min, stats.max, stats.avg, stats.median, stats.stddev, stats.errors)
+			}
+		}
+	}
+}
+
+func outputDetailCommandStats(result benchResult, w *tabwriter.Writer, cmdList []string) {
+	fmt.Fprintf(w, "%s:%d\tMin\tMax\tAvg\tMedian\tStddev\tErrors\t\n", result.name, result.threads)
+	cmdTimings := parseStats(result.statistics[0])
+	for _, cmd := range cmdList {
+		if stats, ok := cmdTimings[cmd]; ok {
+			fmt.Fprintf(w, "%s\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%d\t\n", cmd, stats.min, stats.max, stats.avg, stats.median, stats.stddev, stats.errors)
+		}
+	}
+}
+
+func outputThreadRates(w *tabwriter.Writer, result benchResult) {
+	if result.name == limitBenchmarkName {
+		outputThreadRatesLegacy(w, result)
+		return
+	}
+
+	fmt.Fprintf(w, "%s\t%d", result.name, result.iterations)
+	for i := 1; i <= result.threads; i++ {
+		fmt.Fprintf(w, "\t")
+	}
+	fmt.Fprintf(w, "%7.2f\t ", result.threadRates[0])
+}
+
+func outputThreadRatesLegacy(w *tabwriter.Writer, result benchResult) {
+	fmt.Fprintf(w, "%s\t%d\t%7.2f", result.name, result.iterations, result.threadRates[0])
+	for i := 1; i < result.threads; i++ {
+		fmt.Fprintf(w, "\t%7.2f", result.threadRates[i])
+	}
+	fmt.Fprintln(w, "\t ")
 }
 
 type metricsResults struct {
