@@ -45,6 +45,7 @@ var (
 	trace     bool
 	skipLimit bool
 	overhead  bool
+	legacy    bool
 )
 
 // simple structure to handle collecting output data which will be displayed
@@ -56,6 +57,16 @@ type benchResult struct {
 	iterations  int
 	threadRates []float64
 	statistics  [][]benches.RunStatistics
+}
+
+// simple structure to handle collecting output data which will be displayed
+// after one iteration benchmark is complete
+type benchSingleResult struct {
+	name       string
+	benchInfo  string
+	driverInfo string
+	threadRate float64
+	statistic  []benches.RunStatistics
 }
 
 var runCmd = &cobra.Command{
@@ -118,7 +129,7 @@ iterations and number of concurrent threads. Results will be displayed afterward
 		}
 
 		for _, driverEntry := range benchmark.Drivers {
-			result, err := runBenchmark(ctx, benchType, driverEntry, benchmark)
+			result, err := runBenchmark(ctx, benchType, driverEntry, benchmark, legacy)
 			if err != nil {
 				return err
 			}
@@ -149,63 +160,35 @@ func runLimitTest(ctx context.Context) []float64 {
 	return rates
 }
 
-func runBenchmark(ctx context.Context, benchType benches.Type, driverConfig benches.DriverConfig, benchmark benches.Benchmark) (benchResult, error) {
+func runBenchmark(ctx context.Context, benchType benches.Type, driverConfig benches.DriverConfig, benchmark benches.Benchmark, legacyMode bool) (benchResult, error) {
 	var (
 		rates      []float64
 		stats      [][]benches.RunStatistics
 		benchInfo  string
 		driverInfo string
 	)
-	driverType := driver.StringToType(driverConfig.Type)
-	stats = make([][]benches.RunStatistics, driverConfig.Threads)
 
-	for i := 1; i <= driverConfig.Threads; i++ {
-		bench, err := benches.New(benchType, &driverConfig)
-		if err != nil {
-			return benchResult{}, err
-		}
-
-		imageInfo := benchmark.Image
-		if driverType == driver.Runc || driverType == driver.Ctr {
-			// legacy ctr mode and runc drivers need an exploded rootfs
-			// first, verify that a rootfs was provided in the benchmark YAML
-			if benchmark.RootFs == "" {
-				return benchResult{}, fmt.Errorf("no rootfs defined in the benchmark YAML; driver %s requires a root FS path", driverConfig.Type)
-			}
-
-			imageInfo = benchmark.RootFs
-		}
-
-		err = bench.Init(ctx, benchmark.Name, driverType, driverConfig.ClientPath, imageInfo, benchmark.Command, trace)
-		if err != nil {
-			return benchResult{}, err
-		}
-
-		benchInfo = fmt.Sprintf("%s:%s", benchType, driverConfig.Type)
-
-		if err = bench.Validate(ctx); err != nil {
-			return benchResult{}, fmt.Errorf("error during bench validate: %v", err)
-		}
-
-		if driverInfo == "" {
-			info, err := bench.Info(ctx)
+	if !legacyMode {
+		stats = make([][]benches.RunStatistics, driverConfig.Threads)
+		// Legacy mode in total run N test suites. for each test suite, it runs with n thread and n is the current thread numbers.
+		for i := 1; i <= driverConfig.Threads; i++ {
+			singleResult, err := runBenchmarkOnce(ctx, benchType, driverConfig, benchmark, i)
 			if err != nil {
-				return benchResult{}, errors.Wrap(err, "failed to query driver info")
+				return benchResult{}, err
 			}
-
-			driverInfo = info
+			benchInfo, driverInfo = singleResult.benchInfo, singleResult.driverInfo
+			rates = append(rates, singleResult.threadRate)
+			stats[i-1] = singleResult.statistic
 		}
-
-		err = bench.Run(ctx, i, driverConfig.Iterations, benchmark.Commands)
+	} else {
+		stats = make([][]benches.RunStatistics, 1)
+		singleResult, err := runBenchmarkOnce(ctx, benchType, driverConfig, benchmark, driverConfig.Threads)
 		if err != nil {
-			return benchResult{}, fmt.Errorf("error during bench run: %v", err)
+			return benchResult{}, err
 		}
-
-		duration := bench.Elapsed()
-		rate := float64(i*driverConfig.Iterations) / duration.Seconds()
-		rates = append(rates, rate)
-		stats[i-1] = bench.Stats()
-		log.Infof("%s: threads %d, iterations %d, rate: %6.2f", benchInfo, i, driverConfig.Iterations, rate)
+		benchInfo, driverInfo = singleResult.benchInfo, singleResult.driverInfo
+		rates = append(rates, singleResult.threadRate)
+		stats[0] = singleResult.statistic
 	}
 
 	result := benchResult{
@@ -217,6 +200,63 @@ func runBenchmark(ctx context.Context, benchType benches.Type, driverConfig benc
 		statistics:  stats,
 	}
 
+	return result, nil
+}
+
+// runBenchmark run exact one test suite
+func runBenchmarkOnce(ctx context.Context, benchType benches.Type, driverConfig benches.DriverConfig, benchmark benches.Benchmark, threads int) (benchSingleResult, error) {
+	bench, err := benches.New(benchType, &driverConfig)
+	if err != nil {
+		return benchSingleResult{}, err
+	}
+
+	driverType := driver.StringToType(driverConfig.Type)
+	imageInfo := benchmark.Image
+	if driverType == driver.Runc || driverType == driver.Ctr {
+		// legacy ctr mode and runc drivers need an exploded rootfs
+		// first, verify that a rootfs was provided in the benchmark YAML
+		if benchmark.RootFs == "" {
+			return benchSingleResult{}, fmt.Errorf("no rootfs defined in the benchmark YAML; driver %s requires a root FS path", driverConfig.Type)
+		}
+
+		imageInfo = benchmark.RootFs
+	}
+
+	err = bench.Init(ctx, benchmark.Name, driverType, driverConfig.ClientPath, imageInfo, benchmark.Command, trace)
+	if err != nil {
+		return benchSingleResult{}, err
+	}
+
+	benchInfo := fmt.Sprintf("%s:%s", benchType, driverConfig.Type)
+
+	if err = bench.Validate(ctx); err != nil {
+		return benchSingleResult{}, fmt.Errorf("error during bench validate: %v", err)
+	}
+
+	info, err := bench.Info(ctx)
+	if err != nil {
+		return benchSingleResult{}, errors.Wrap(err, "failed to query driver info")
+	}
+
+	driverInfo := info
+
+	err = bench.Run(ctx, threads, driverConfig.Iterations, benchmark.Commands)
+	if err != nil {
+		return benchSingleResult{}, fmt.Errorf("error during bench run: %v", err)
+	}
+
+	duration := bench.Elapsed()
+	rate := float64(threads*driverConfig.Iterations) / duration.Seconds()
+
+	result := benchSingleResult{
+		name:       benchInfo,
+		driverInfo: driverInfo,
+		benchInfo:  benchInfo,
+		threadRate: rate,
+		statistic:  bench.Stats(),
+	}
+
+	log.Infof("%s: threads %d, iterations %d, rate: %6.2f", benchInfo, threads, driverConfig.Iterations, rate)
 	return result, nil
 }
 
@@ -255,6 +295,7 @@ func outputRunDetails(maxThreads int, results []benchResult, overhead bool) {
 	fmt.Printf("DETAILED COMMAND TIMINGS/STATISTICS\n")
 	// output per-command timings across the runs as well
 	for _, result := range results {
+		// only 1 result
 		if result.name == limitBenchmarkName {
 			// the limit "benchmark" has no detailed statistics
 			continue
@@ -515,4 +556,5 @@ func init() {
 	runCmd.PersistentFlags().BoolVarP(&trace, "trace", "t", false, "Enable per-container tracing during benchmark runs")
 	runCmd.PersistentFlags().BoolVarP(&skipLimit, "skip-limit", "s", false, "Skip 'limit' benchmark run")
 	runCmd.PersistentFlags().BoolVarP(&overhead, "overhead", "o", false, "Output daemon overhead")
+	runCmd.PersistentFlags().BoolVarP(&legacy, "legacy", "l", false, "legacy mode will run benchmark from 1 to N(thread number) iterations.")
 }
